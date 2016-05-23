@@ -14,4 +14,4 @@ erl_crash.dump
 logs
 _build
 *~
-priv/cq.so
+priv/*.so

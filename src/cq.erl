@@ -1,5 +1,5 @@
 -module(cq).
--export([in/1, out/0]).
+-export([new/3, free/1, push/2, pop/1, size/1, debug/1, print_bits/0]).
 -on_load(nif_init/0).
 
 
@@ -8,17 +8,44 @@
 %%====================================================================
 
 
-%% Block at 5 elements in queue
+new(_QueueId, _QueueSize, _OverflowSize) ->
+    exit(nif_not_loaded).
 
-%% Take one message, blocks until a message returns
-out() ->
-    exit(not_loaded).
+free(_QueueId) ->
+    exit(nif_not_loaded).
+
+push(_QueueId, _Term) ->
+    exit(nif_not_loaded).
 
 
-%% Publish, might block
+async_pop(_QueueId) ->
+    exit(nif_not_loaded).
 
-in(_Msg) ->
-    exit(not_loaded).
+
+pop(QueueId) ->
+    case async_pop(QueueId) of
+        wait_for_msg ->
+            error_logger:info_msg("Blocking Erlang process in receive, waiting for reply from async_pop~n"),
+            receive
+                {pop, Term} ->
+                    {ok, Term}
+            end;
+        {pop, Term} ->
+            {ok, Term}
+    end.
+
+
+size(_QueueId) ->
+    exit(nif_not_loaded).
+
+
+debug(_QueueId) ->
+    exit(nif_not_loaded).
+
+
+print_bits() ->
+    exit(nif_not_loaded).
+
 
 
 %%====================================================================
