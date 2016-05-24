@@ -44,24 +44,43 @@
 %%                  cq:debug(?QUEUE_ID)).
 
 
-%% pop_empty_test() ->
-%%     {ok, _} = cq:new(?QUEUE_ID, 8, 8),
-%%     ?assertEqual(ok, cq:pop(?QUEUE_ID)).
+pop_empty_blocks_test() ->
+    Parent = self(),
+    {ok, _} = cq:new(?QUEUE_ID, 8, 8),
+    ?assertEqual([], cq:debug_poppers(?QUEUE_ID)),
 
-print_bits_test() ->
-    cq:print_bits(),
-    cq:print_bits(),
-    cq:print_bits(),
-    cq:print_bits(),
-    cq:print_bits(),
-    cq:print_bits(),
-    cq:print_bits(),
-    cq:print_bits(),
-    cq:print_bits(),
-    cq:print_bits(),
-    cq:print_bits(),
+    Popper = spawn(fun () ->
+                           Parent ! go,
+                           Ret = cq:pop(?QUEUE_ID),
+                           Parent ! {popped, Ret}
+                   end),
 
-    ok.
+    receive go ->
+            timer:sleep(100), % ensure popper is in pop/1
+
+            ?assertEqual([Popper], cq:debug_poppers(?QUEUE_ID)),
+
+            ?assertEqual(ok, cq:push(?QUEUE_ID, foo))
+    end,
+
+    receive M1 ->
+            ?assertEqual({popped, {ok, foo}}, M1)
+    end.
+
+%% print_bits_test() ->
+%%     cq:print_bits(),
+%%     cq:print_bits(),
+%%     cq:print_bits(),
+%%     cq:print_bits(),
+%%     cq:print_bits(),
+%%     cq:print_bits(),
+%%     cq:print_bits(),
+%%     cq:print_bits(),
+%%     cq:print_bits(),
+%%     cq:print_bits(),
+%%     cq:print_bits(),
+
+%%     ok.
 
 %% wraparound_test() ->
 %%     {ok, _} = cq:new(?QUEUE_ID, 8, 8),

@@ -1,5 +1,6 @@
 -module(cq).
--export([new/3, free/1, push/2, pop/1, size/1, debug/1, print_bits/0]).
+-export([new/3, free/1, push/2, pop/1, size/1]).
+-export([debug/1, debug_poppers/1, print_bits/0]).
 -on_load(nif_init/0).
 
 
@@ -40,6 +41,9 @@ size(_QueueId) ->
 
 
 debug(_QueueId) ->
+    exit(nif_not_loaded).
+
+debug_poppers(_QueueId) ->
     exit(nif_not_loaded).
 
 

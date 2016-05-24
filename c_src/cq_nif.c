@@ -69,6 +69,9 @@ queue_new(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     q->overflow_terms = calloc(q->overflow_size, CACHE_LINE_SIZE);
     q->overflow_envs  = calloc(q->queue_size, CACHE_LINE_SIZE);
 
+    q->push_queue = new_queue();
+    q->pop_queue = new_queue();
+
     /* TODO: Check calloc return */
 
 
@@ -134,6 +137,26 @@ queue_push(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                 i, i*CACHE_LINE_SIZE, q->slots_states[i*CACHE_LINE_SIZE]);
     }
 
+    /* If there's consumers waiting, the queue must be empty and we
+       should directly pick a consumer to notify. */
+
+    ErlNifPid *waiting_consumer;
+    int dequeue_ret = dequeue(q->pop_queue, &waiting_consumer);
+    if (dequeue_ret) {
+        ErlNifEnv *msg_env = enif_alloc_env();
+        ERL_NIF_TERM copy = enif_make_copy(msg_env, argv[1]);
+        ERL_NIF_TERM tuple = enif_make_tuple2(msg_env, mk_atom(env, "pop"), copy);
+
+        if (enif_send(env, waiting_consumer, msg_env, tuple)) {
+            enif_free_env(msg_env);
+            return mk_atom(env, "ok");
+        } else {
+            return mk_error(env, "notify_failed");
+        }
+    }
+
+
+
     /* Increment head and attempt to claim the slot by marking it as
        busy. This ensures no other thread will attempt to modify this
        slot. If we cannot lock it, another thread must have */
@@ -151,8 +174,6 @@ queue_push(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 
         case STATE_EMPTY:
             head = __sync_add_and_fetch(&q->head, 1);
-            fprintf(stderr, "new head %lu, state %d\n",
-                    SLOT_INDEX(head, size), q->slots_states[SLOT_INDEX(head, size)]);
 
         case STATE_WRITE:
             /* We acquired the write lock, go ahead with the write. */
@@ -165,8 +186,6 @@ queue_push(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             return mk_error(env, "full_not_implemented");
         }
     }
-
-    fprintf(stderr, "found free slot at head %lu\n", head);
 
     /* If head catches up with tail, the queue is full. Add to
        overflow instead */
@@ -212,12 +231,12 @@ queue_async_pop(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (q == NULL)
         return mk_error(env, "bad_queue_id");
 
-    fprintf(stderr, "q->id %d, queue_id %d\n", q->id, queue_id);
     if (q->id != queue_id)
         return mk_error(env, "not_identical_queue_id");
 
     uint64_t qsize = q->queue_size;
     uint64_t tail = q->tail;
+    uint64_t num_busy = 0;
 
     /* Walk the buffer starting the tail position until we are either
        able to consume a term or find an empty slot. */
@@ -227,29 +246,42 @@ queue_async_pop(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
                                                    STATE_FULL,
                                                    STATE_READ);
 
-        switch (ret) {
-
-        case STATE_READ:
+        if (ret == STATE_READ) {
             /* We were able to mark the term as read in progress. We
                now have an exclusive lock. */
             break;
 
-        case STATE_WRITE:
-            /* We found an item with a write in progress. We could
-               spin on acquiring a read lock, but that would break the
-               fixed number of instructions guarantee. */
+        } else if (ret == STATE_WRITE) {
+            /* We found an item with a write in progress. If that
+               thread progresses, it will eventually mark the slot as
+               full. We can spin until that happens.
 
-        case STATE_EMPTY:
+               This can take an arbitrary amount of time and multiple
+               reading threads will compete for the same slot.
+
+               Instead we add the caller to the queue of blocking
+               consumers. When the next producer comes it will "help"
+               this thread by calling enif_send on the current
+               in-progress term *and* handle it's own terms. If
+               there's no new push to the queue, this will block
+               forever. */
+            return mk_atom(env, "write_in_progress_not_implemented");
+
+        } else if (ret == STATE_EMPTY) {
             /* We found an empty item. Queue must be empty. Add
                calling Erlang consumer process to queue of waiting
-               processes. When the next producer comes along, it will
-               pick up waiting consumers and call enif_send */
+               processes. When the next producer comes along, it first
+               checks the waiting consumers and calls enif_send
+               instead of writing to the slots. */
+
+            ErlNifPid *pid = enif_alloc(sizeof(ErlNifPid));
+            pid = enif_self(env, pid);
+            enqueue(q->pop_queue, pid);
+
             return mk_atom(env, "wait_for_msg");
 
-        default:
+        } else {
             tail = __sync_add_and_fetch(&q->tail, 1);
-            fprintf(stderr, "new tail %lu\n", tail);
-
         }
     }
 
@@ -302,12 +334,69 @@ queue_debug(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
             slots_terms[i] = enif_make_copy(env, q->slots_terms[i * CACHE_LINE_SIZE]);
         }
     }
-
     return enif_make_tuple4(env,
                             enif_make_uint64(env, q->tail),
                             enif_make_uint64(env, q->head),
                             enif_make_list_from_array(env, slots_states, q->queue_size),
                             enif_make_list_from_array(env, slots_terms, q->queue_size));
+}
+
+static ERL_NIF_TERM
+queue_debug_poppers(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
+{
+    uint32_t queue_id = 0;
+
+    if (!enif_get_uint(env, argv[0], &queue_id))
+        return mk_error(env, "badarg");
+
+    if (queue_id > 8)
+        return mk_error(env, "badarg");
+
+    cq_t *q = QUEUES[queue_id];
+    if (q == NULL)
+        return mk_error(env, "bad_queue_id");
+
+
+    uint64_t pop_queue_size = 0;
+    cq_node_t *node = q->pop_queue->head;
+    if (node->value == NULL) {
+        node = node->next;
+        node = Q_PTR(node);
+    }
+
+    while (node != NULL) {
+        pop_queue_size++;
+        node = node->next;
+        node = Q_PTR(node);
+    }
+
+    ERL_NIF_TERM *pop_queue_pids = enif_alloc(sizeof(ERL_NIF_TERM) * pop_queue_size);
+
+    node = q->pop_queue->head;
+    node = Q_PTR(node);
+    if (node->value == NULL) {
+        node = node->next;
+        node = Q_PTR(node);
+    }
+
+    uint64_t i = 0;
+    while (node != NULL) {
+        if (node->value == 0) {
+            pop_queue_pids[i] = mk_atom(env, "null");
+        }
+        else {
+            pop_queue_pids[i] = enif_make_pid(env, node->value);
+        }
+
+        i++;
+        node = node->next;
+        node = Q_PTR(node);
+    }
+
+    ERL_NIF_TERM list = enif_make_list_from_array(env, pop_queue_pids, pop_queue_size);
+    enif_free(pop_queue_pids);
+
+    return list;
 }
 
 
@@ -341,6 +430,108 @@ void free_resource(ErlNifEnv* env, void* arg)
 }
 
 
+cq_queue_t * new_queue()
+{
+    cq_queue_t *queue = enif_alloc(sizeof(cq_queue_t));
+    cq_node_t *node = enif_alloc(sizeof(cq_node_t));
+    node->next = NULL;
+    //node->env = NULL;
+    node->value = NULL;
+    queue->head = node;
+    queue->tail = node;
+
+    return queue;
+}
+
+
+
+void enqueue(cq_queue_t *queue, ErlNifPid *pid)
+{
+    cq_node_t *node = enif_alloc(sizeof(cq_node_t));
+    //node->env = enif_alloc_env();
+    //node->term = enif_make_copy(node->env, term);
+    node->value = pid;
+    node->next = NULL;
+    fprintf(stderr, "node %lu\n", node);
+
+    cq_node_t *tail = NULL;
+    uint64_t tail_count = 0;
+    while (1) {
+        tail = queue->tail;
+        cq_node_t *tail_ptr = Q_PTR(tail);
+        tail_count = Q_COUNT(tail);
+
+        cq_node_t *next = tail->next;
+        cq_node_t *next_ptr = Q_PTR(next);
+        uint64_t next_count = Q_COUNT(next);
+
+        if (tail == queue->tail) {
+            fprintf(stderr, "tail == queue->tail\n");
+            if (next_ptr == NULL) {
+                fprintf(stderr, "next_ptr == NULL\n");
+                if (__sync_bool_compare_and_swap(&tail_ptr->next,
+                                                 next,
+                                                 Q_SET_COUNT(node, next_count+1)))
+                    fprintf(stderr, "CAS(tail_ptr->next, next, (node, next_count+1)) -> true\n");
+                    break;
+            } else {
+                __sync_bool_compare_and_swap(&queue->tail,
+                                             tail,
+                                             Q_SET_COUNT(next_ptr, next_count+1));
+                    fprintf(stderr, "CAS(queue->tail, tail, (next_ptr, next_count+1))\n");
+            }
+        }
+    }
+
+    cq_node_t *node_with_count = Q_SET_COUNT(node, tail_count+1);
+    int ret = __sync_bool_compare_and_swap(&queue->tail,
+                                           tail,
+                                           node_with_count);
+    fprintf(stderr, "CAS(queue->tail, tail, %lu) -> %d\n", node_with_count, ret);
+}
+
+
+int dequeue(cq_queue_t *queue, ErlNifPid **pid)
+{
+    fprintf(stderr, "dequeue\n");
+    cq_node_t *head, *head_ptr, *tail, *tail_ptr, *next, *next_ptr;
+
+    while (1) {
+        head = queue->head;
+        head_ptr = Q_PTR(head);
+        tail = queue->tail;
+        tail_ptr = Q_PTR(tail);
+        next = head->next;
+        next_ptr = Q_PTR(next);
+        fprintf(stderr, "head %lu, tail %lu, next %lu\n", head, tail, next);
+
+        if (head == queue->head) {
+            if (head_ptr == tail_ptr) {
+                if (next_ptr == NULL) {
+                    return 0; /* Queue is empty */
+                }
+                fprintf(stderr, "CAS(queue->tail, tail, (next_ptr, tail+1))\n");
+                __sync_bool_compare_and_swap(&queue->tail,
+                                             tail,
+                                             Q_SET_COUNT(next_ptr, Q_COUNT(tail)+1));
+            } else {
+                fprintf(stderr, "next->value %lu\n", next_ptr->value);
+                *pid = next_ptr->value;
+                fprintf(stderr, "CAS(queue->head, head, (next_ptr, head+1))\n");
+                if (__sync_bool_compare_and_swap(&queue->head,
+                                                 head,
+                                                 Q_SET_COUNT(next_ptr, Q_COUNT(head)+1)))
+                    break;
+            }
+        }
+    }
+    // free pid
+    //enif_free(Q_PTR(head));
+    return 1;
+}
+
+
+
 
 int load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info) {
     /* Initialize global array mapping id to cq_t ptr */
@@ -366,6 +557,7 @@ static ErlNifFunc nif_funcs[] = {
     {"push"     , 2, queue_push},
     {"async_pop", 1, queue_async_pop},
     {"debug"    , 1, queue_debug},
+    {"debug_poppers", 1, queue_debug_poppers},
     {"print_bits", 0, print_bits}
 };
 
